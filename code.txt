@@ -1,17 +1,21 @@
-from flask import Flask, request, jsonify
-import razorpay
+# Sample movie data
+movies = [
+    {"id": 1, "name": "Inception", "year": 2010},
+    {"id": 2, "name": "Interstellar", "year": 2014},
+    {"id": 3, "name": "The Dark Knight", "year": 2008}
+]
 
-app = Flask(__name__)
+# Get all movies
+@app.route("/movies", methods=["GET"])
+def get_movies():
+    return jsonify(movies)
 
-client = razorpay.Client(auth=("KEY_ID", "KEY_SECRET"))
-
-@app.route("/create_order", methods=["POST"])
-def create_order():
-    order = client.order.create({
-        "amount": 50000,  # ₹500 in paise
-        "currency": "INR"
-    })
-    return jsonify(order)
+# Get single movie
+@app.route("/movies/<int:id>", methods=["GET"])
+def get_movie(id):
+    movie = next((m for m in movies if m["id"] == id), None)
+    return jsonify(movie if movie else {"error": "Not found"})
 
 if __name__ == "__main__":
-    app.run()
+    app.run(debug=True)
+
