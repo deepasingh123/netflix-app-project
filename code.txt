@@ -1,1 +1,17 @@
-Hello World
+from flask import Flask, request, jsonify
+import razorpay
+
+app = Flask(__name__)
+
+client = razorpay.Client(auth=("KEY_ID", "KEY_SECRET"))
+
+@app.route("/create_order", methods=["POST"])
+def create_order():
+    order = client.order.create({
+        "amount": 50000,  # ₹500 in paise
+        "currency": "INR"
+    })
+    return jsonify(order)
+
+if __name__ == "__main__":
+    app.run()
