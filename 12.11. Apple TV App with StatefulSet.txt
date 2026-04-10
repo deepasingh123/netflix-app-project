@@ -1,0 +1,1308 @@
+Apple TV App with MySQL StatefulSet - Dynamic Provisioning of EBS Volumes
+===================================
+🟢 EFS
+All pods → SAME storage → SAME data
+🔴 EBS
+Each pod → OWN storage → DIFFERENT data
+
+
+
+Frontend Pods
+DB Pod(s)
+
+🧱 ARCHITECTURE YOU ARE BUILDING
+You will have:
+Stateless Layer
+Python Flask App
+Deployment → 2 replicas
+
+Stateful Layer
+MySQL
+StatefulSet → 1 replica
+Persistent EBS volume (5Gi)
+
+Storage
+Custom StorageClass
+ReclaimPolicy = Retain
+
+✅ STEP 1 – Install Helm (If not installed)
+curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+helm version
+
+✅ STEP 2 – Attach IAM Policy to Worker Node Role
+Policy Name: AmazonEBSCSIDriverPolicy
+
+Why?
+👉 Allows Kubernetes to create & attach EBS volumes.
+
+✅ STEP 3 – Install AWS EBS CSI Driver (Helm)
+helm repo add aws-ebs-csi-driver https://kubernetes-sigs.github.io/aws-ebs-csi-driver
+helm repo update
+
+Install:
+helm install aws-ebs-csi-driver aws-ebs-csi-driver/aws-ebs-csi-driver \
+  --namespace kube-system
+
+Verify:
+kubectl get pods -n kube-system | grep ebs
+
+✅ STEP 4 – Create Custom StorageClass (Retain Policy)
+
+storageclass-retain.yml
+
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: retain-gp3
+provisioner: ebs.csi.aws.com
+# Retain ensures volume is NOT deleted when PVC is removed
+reclaimPolicy: Retain
+volumeBindingMode: WaitForFirstConsumer
+parameters:
+  type: gp3
+
+Apply:
+kubectl apply -f storageclass-retain.yml
+
+✅ STEP 5 – Headless Service for MySQL
+Required for StatefulSet stable DNS.
+
+mysql-headless.yml
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: mysql
+spec:
+  clusterIP: None   # HEADLESS (critical)
+  selector:
+    app: mysql
+  ports:
+    - port: 3306
+
+Apply:
+kubectl apply -f mysql-headless.yml
+
+✅ STEP 6 – MySQL StatefulSet (5Gi Persistent Volume)
+
+mysql-statefulset.yml
+
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: mysql
+spec:
+  serviceName: mysql   # Must match headless service
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mysql
+  template:
+    metadata:
+      labels:
+        app: mysql
+    spec:
+      containers:
+        - name: mysql
+          image: mysql:8
+          env:
+            - name: MYSQL_ROOT_PASSWORD
+              value: rootpass
+            - name: MYSQL_DATABASE
+              value: appdb
+          ports:
+            - containerPort: 3306
+          volumeMounts:
+            - name: mysql-data
+              mountPath: /var/lib/mysql
+  volumeClaimTemplates:
+    - metadata:
+        name: mysql-data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: retain-gp3
+        resources:
+          requests:
+            storage: 5Gi
+
+Apply:
+kubectl apply -f mysql-statefulset.yml
+
+Check:
+kubectl get pods
+kubectl get pvc
+
+🧠 IMPORTANT RESULT
+Pod name will ALWAYS be:
+mysql-0
+
+DNS name:
+mysql-0.mysql
+
+Stable forever.
+
+-----------------------------------------------
+Note: if we change statefulset "replicas: 2" then 2 statefulset Pods will be created:
+mysql-0
+mysql-1
+
+❗ VERY IMPORTANT CONCEPT
+👉 Each pod gets its OWN volume
+Pod		PVC					EBS Volume
+mysql-0	mysql-data-mysql-0		vol-aaa
+mysql-1	mysql-data-mysql-1		vol-bbb
+
+❌ Do they share data?
+👉 NO — DATA IS NOT SHARED
+Why?
+StorageClass uses:
+ReadWriteOnce
+EBS supports only single node attachment
+
+👉 So:
+mysql-0 → its own DB
+mysql-1 → completely separate DB
+
+so data in mysql-0 ≠ mysql-1 data
+No replication
+No sync
+👉 You now have 2 independent databases (this is wrong for production)
+
+✅ What if replicas = 1 (Current setup)
+replicas: 1
+👉 Only:
+mysql-0
+One PVC
+One EBS volume
+
+✔️ Behavior
+Simple DB
+No confusion
+Data persists even after restart
+👉 This is the correct setup for basic apps
+-----------------------------------------------
+
+✅ STEP 7 – Python Flask Application
+
+app.py
+from flask import Flask, request, render_template_string
+import mysql.connector
+
+app = Flask(__name__)
+
+DB_HOST = "mysql-0.mysql"   # StatefulSet DNS
+DB_USER = "root"
+DB_PASS = "rootpass"
+DB_NAME = "appdb"
+
+HTML_FORM = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Apple TV+ Registration</title>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=SF+Pro+Display:wght@300;400;500;600&display=swap');
+        
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'SF Pro Display', -apple-system, BlinkMacSystemFont, sans-serif;
+            background: #000000;
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            position: relative;
+            overflow-x: hidden;
+        }
+
+        /* Apple TV Dynamic Background */
+        .video-background {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            z-index: 0;
+            overflow: hidden;
+        }
+
+        .video-background video {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+            opacity: 0.4;
+            transform: scale(1.1);
+            animation: slowZoom 20s infinite alternate;
+        }
+
+        .overlay {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: radial-gradient(circle at center, rgba(0,0,0,0.3) 0%, rgba(0,0,0,0.8) 100%);
+            z-index: 1;
+        }
+
+        /* Animated gradient orbs */
+        .orb {
+            position: fixed;
+            width: 600px;
+            height: 600px;
+            background: radial-gradient(circle at center, rgba(255,45,85,0.15) 0%, transparent 70%);
+            border-radius: 50%;
+            filter: blur(60px);
+            animation: floatOrb 25s infinite ease-in-out;
+            z-index: 1;
+        }
+
+        .orb-2 {
+            left: -200px;
+            top: -200px;
+            background: radial-gradient(circle at center, rgba(100,210,255,0.12) 0%, transparent 70%);
+            animation-delay: -5s;
+            width: 800px;
+            height: 800px;
+        }
+
+        .orb-3 {
+            right: -300px;
+            bottom: -200px;
+            background: radial-gradient(circle at center, rgba(255,200,100,0.1) 0%, transparent 70%);
+            animation-delay: -10s;
+            width: 700px;
+            height: 700px;
+        }
+
+        /* Main container */
+        .container {
+            position: relative;
+            z-index: 10;
+            width: 90%;
+            max-width: 800px;
+            margin: 2rem auto;
+            animation: fadeInUp 1s ease-out;
+        }
+
+        /* Apple TV Header */
+        .apple-tv-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            margin-bottom: 3rem;
+            padding: 0 1rem;
+        }
+
+        .logo {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .logo svg {
+            width: 40px;
+            height: 40px;
+            filter: drop-shadow(0 4px 6px rgba(0,0,0,0.3));
+            transition: transform 0.3s ease;
+        }
+
+        .logo svg:hover {
+            transform: scale(1.05);
+        }
+
+        .logo span {
+            color: white;
+            font-size: 24px;
+            font-weight: 500;
+            letter-spacing: 1px;
+        }
+
+        .plus-badge {
+            background: rgba(255,255,255,0.1);
+            backdrop-filter: blur(10px);
+            padding: 8px 16px;
+            border-radius: 20px;
+            color: white;
+            font-size: 14px;
+            font-weight: 500;
+            border: 1px solid rgba(255,255,255,0.2);
+            transition: all 0.3s ease;
+        }
+
+        .plus-badge:hover {
+            background: rgba(255,255,255,0.2);
+            border-color: rgba(255,255,255,0.4);
+            transform: translateY(-2px);
+        }
+
+        /* Hero Section */
+        .hero-section {
+            margin-bottom: 3rem;
+            text-align: center;
+        }
+
+        .hero-title {
+            color: white;
+            font-size: 48px;
+            font-weight: 600;
+            margin-bottom: 1rem;
+            text-shadow: 0 4px 12px rgba(0,0,0,0.5);
+            animation: slideDown 0.8s ease-out;
+        }
+
+        .hero-subtitle {
+            color: rgba(255,255,255,0.7);
+            font-size: 20px;
+            font-weight: 300;
+            margin-bottom: 2rem;
+            animation: slideUp 0.8s ease-out 0.2s both;
+        }
+
+        /* Registration Card */
+        .registration-card {
+            background: rgba(20, 20, 25, 0.7);
+            backdrop-filter: blur(20px);
+            border-radius: 24px;
+            padding: 3rem;
+            box-shadow: 0 20px 40px rgba(0,0,0,0.4);
+            border: 1px solid rgba(255,255,255,0.1);
+            animation: scaleIn 0.6s ease-out 0.3s both;
+        }
+
+        .form-title {
+            color: white;
+            font-size: 28px;
+            font-weight: 500;
+            margin-bottom: 2rem;
+            text-align: center;
+        }
+
+        /* Form Groups */
+        .form-group {
+            margin-bottom: 1.5rem;
+            position: relative;
+        }
+
+        .form-label {
+            display: block;
+            color: rgba(255,255,255,0.7);
+            font-size: 14px;
+            font-weight: 500;
+            margin-bottom: 8px;
+            letter-spacing: 0.5px;
+            transition: color 0.3s ease;
+        }
+
+        .form-input {
+            width: 100%;
+            padding: 16px 20px;
+            background: rgba(255,255,255,0.05);
+            border: 2px solid rgba(255,255,255,0.1);
+            border-radius: 12px;
+            color: white;
+            font-size: 16px;
+            transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+            outline: none;
+        }
+
+        .form-input:hover {
+            background: rgba(255,255,255,0.08);
+            border-color: rgba(255,255,255,0.2);
+        }
+
+        .form-input:focus {
+            background: rgba(255,255,255,0.1);
+            border-color: #ff2d55;
+            box-shadow: 0 0 0 4px rgba(255,45,85,0.1);
+        }
+
+        .form-input::placeholder {
+            color: rgba(255,255,255,0.3);
+            font-weight: 300;
+        }
+
+        /* Gender Selection */
+        .gender-group {
+            display: flex;
+            gap: 1.5rem;
+            margin-top: 0.5rem;
+        }
+
+        .gender-option {
+            flex: 1;
+            position: relative;
+        }
+
+        .gender-input {
+            display: none;
+        }
+
+        .gender-label {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 14px;
+            background: rgba(255,255,255,0.05);
+            border: 2px solid rgba(255,255,255,0.1);
+            border-radius: 12px;
+            color: rgba(255,255,255,0.7);
+            font-size: 16px;
+            cursor: pointer;
+            transition: all 0.3s ease;
+        }
+
+        .gender-label:hover {
+            background: rgba(255,255,255,0.1);
+            border-color: rgba(255,255,255,0.3);
+            transform: translateY(-2px);
+        }
+
+        .gender-input:checked + .gender-label {
+            background: #ff2d55;
+            border-color: #ff2d55;
+            color: white;
+            box-shadow: 0 8px 16px rgba(255,45,85,0.3);
+        }
+
+        /* Submit Button */
+        .submit-btn {
+            width: 100%;
+            padding: 18px 24px;
+            background: linear-gradient(135deg, #ff2d55 0%, #ff375f 100%);
+            border: none;
+            border-radius: 14px;
+            color: white;
+            font-size: 18px;
+            font-weight: 600;
+            letter-spacing: 1px;
+            cursor: pointer;
+            transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+            position: relative;
+            overflow: hidden;
+            margin-top: 1rem;
+        }
+
+        .submit-btn::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: -100%;
+            width: 100%;
+            height: 100%;
+            background: linear-gradient(90deg, transparent, rgba(255,255,255,0.2), transparent);
+            transition: left 0.5s ease;
+        }
+
+        .submit-btn:hover {
+            transform: translateY(-4px);
+            box-shadow: 0 16px 24px rgba(255,45,85,0.4);
+        }
+
+        .submit-btn:hover::before {
+            left: 100%;
+        }
+
+        .submit-btn:active {
+            transform: translateY(-2px);
+            box-shadow: 0 8px 12px rgba(255,45,85,0.4);
+        }
+
+        /* Success Message */
+        .success-message {
+            background: rgba(48, 209, 88, 0.1);
+            backdrop-filter: blur(10px);
+            border: 1px solid rgba(48, 209, 88, 0.3);
+            border-radius: 16px;
+            padding: 1.5rem;
+            margin-bottom: 2rem;
+            color: #30d158;
+            text-align: center;
+            animation: slideDown 0.5s ease-out;
+        }
+
+        /* Featured Content */
+        .featured-content {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 1.5rem;
+            margin-top: 3rem;
+        }
+
+        .feature-item {
+            background: rgba(255,255,255,0.05);
+            backdrop-filter: blur(10px);
+            border-radius: 16px;
+            padding: 1.5rem;
+            text-align: center;
+            transition: all 0.4s cubic-bezier(0.4, 0, 0.2, 1);
+            border: 1px solid rgba(255,255,255,0.1);
+        }
+
+        .feature-item:hover {
+            transform: translateY(-8px) scale(1.02);
+            background: rgba(255,255,255,0.08);
+            border-color: rgba(255,255,255,0.2);
+            box-shadow: 0 16px 32px rgba(0,0,0,0.3);
+        }
+
+        .feature-icon {
+            font-size: 32px;
+            margin-bottom: 1rem;
+            display: inline-block;
+            animation: pulse 2s infinite;
+        }
+
+        .feature-title {
+            color: white;
+            font-size: 16px;
+            font-weight: 600;
+            margin-bottom: 0.5rem;
+        }
+
+        .feature-desc {
+            color: rgba(255,255,255,0.5);
+            font-size: 12px;
+        }
+
+        /* Animations */
+        @keyframes fadeInUp {
+            from {
+                opacity: 0;
+                transform: translateY(30px);
+            }
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+
+        @keyframes slideDown {
+            from {
+                opacity: 0;
+                transform: translateY(-30px);
+            }
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+
+        @keyframes slideUp {
+            from {
+                opacity: 0;
+                transform: translateY(30px);
+            }
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+
+        @keyframes scaleIn {
+            from {
+                opacity: 0;
+                transform: scale(0.95);
+            }
+            to {
+                opacity: 1;
+                transform: scale(1);
+            }
+        }
+
+        @keyframes floatOrb {
+            0%, 100% {
+                transform: translate(0, 0) scale(1);
+            }
+            25% {
+                transform: translate(-5%, -5%) scale(1.05);
+            }
+            50% {
+                transform: translate(5%, 5%) scale(0.95);
+            }
+            75% {
+                transform: translate(-5%, 5%) scale(1.02);
+            }
+        }
+
+        @keyframes slowZoom {
+            0% {
+                transform: scale(1.1);
+            }
+            100% {
+                transform: scale(1.2);
+            }
+        }
+
+        @keyframes pulse {
+            0%, 100% {
+                transform: scale(1);
+            }
+            50% {
+                transform: scale(1.1);
+            }
+        }
+
+        /* Responsive */
+        @media (max-width: 768px) {
+            .hero-title {
+                font-size: 36px;
+            }
+            
+            .hero-subtitle {
+                font-size: 18px;
+            }
+            
+            .registration-card {
+                padding: 2rem;
+            }
+            
+            .gender-group {
+                flex-direction: column;
+                gap: 1rem;
+            }
+            
+            .featured-content {
+                grid-template-columns: 1fr;
+            }
+        }
+    </style>
+</head>
+<body>
+    <!-- Apple TV Dynamic Background -->
+    <div class="video-background">
+        <video autoplay loop muted playsinline>
+            <source src="https://videos.pexels.com/video-files/2103099/2103099-uhd_3840_2160_25fps.mp4" type="video/mp4">
+        </video>
+    </div>
+    
+    <!-- Gradient Orbs -->
+    <div class="orb"></div>
+    <div class="orb orb-2"></div>
+    <div class="orb orb-3"></div>
+    
+    <!-- Overlay -->
+    <div class="overlay"></div>
+
+    <!-- Main Container -->
+    <div class="container">
+        <!-- Apple TV Header -->
+        <div class="apple-tv-header">
+            <div class="logo">
+                <svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                    <path d="M18.71 13.09C18.71 13.09 19.12 10.5 17.5 8.5C15.88 6.5 13.5 6 13.5 6C13.5 6 15 4 12 2C9 4 10.5 6 10.5 6C10.5 6 8.12 6.5 6.5 8.5C4.88 10.5 5.29 13.09 5.29 13.09C5.29 13.09 4 15.5 4 18C4 22 8 22 8 22H16C16 22 20 22 20 18C20 15.5 18.71 13.09 18.71 13.09Z" stroke="white" stroke-width="1.5" fill="transparent"/>
+                    <path d="M12 13V22" stroke="white" stroke-width="1.5"/>
+                    <path d="M12 13L9 10L12 7L15 10L12 13Z" fill="white"/>
+                </svg>
+                <span>Apple TV+</span>
+            </div>
+            <div class="plus-badge">
+                FREE TRIAL
+            </div>
+        </div>
+
+        <!-- Hero Section -->
+        <div class="hero-section">
+            <h1 class="hero-title">Welcome to Apple TV+</h1>
+            <p class="hero-subtitle">Watch award-winning Apple Originals on all your devices.</p>
+        </div>
+
+        {% if request.method == "POST" %}
+        <div class="success-message">
+            ✨ Welcome to Apple TV+! Your registration was successful.
+        </div>
+        {% endif %}
+
+        <!-- Registration Card -->
+        <div class="registration-card">
+            <h2 class="form-title">Create Your Account</h2>
+            <form method="post">
+                <div class="form-group">
+                    <label class="form-label" for="name">FULL NAME</label>
+                    <input class="form-input" type="text" id="name" name="name" placeholder="Enter your name" required>
+                </div>
+                
+                <div class="form-group">
+                    <label class="form-label" for="email">EMAIL ADDRESS</label>
+                    <input class="form-input" type="email" id="email" name="email" placeholder="Enter your email" required>
+                </div>
+                
+                <div class="form-group">
+                    <label class="form-label">GENDER</label>
+                    <div class="gender-group">
+                        <div class="gender-option">
+                            <input type="radio" id="male" name="gender" value="Male" class="gender-input">
+                            <label for="male" class="gender-label">♂ Male</label>
+                        </div>
+                        <div class="gender-option">
+                            <input type="radio" id="female" name="gender" value="Female" class="gender-input">
+                            <label for="female" class="gender-label">♀ Female</label>
+                        </div>
+                        <div class="gender-option">
+                            <input type="radio" id="other" name="gender" value="Other" class="gender-input">
+                            <label for="other" class="gender-label">⚲ Other</label>
+                        </div>
+                    </div>
+                </div>
+                
+                <button type="submit" class="submit-btn">
+                    Start Watching Now
+                </button>
+            </form>
+        </div>
+
+        <!-- Featured Content -->
+        <div class="featured-content">
+            <div class="feature-item">
+                <span class="feature-icon">🎬</span>
+                <h3 class="feature-title">Apple Originals</h3>
+                <p class="feature-desc">Exclusive shows and movies</p>
+            </div>
+            <div class="feature-item">
+                <span class="feature-icon">📱</span>
+                <h3 class="feature-title">All Devices</h3>
+                <p class="feature-desc">Watch on your iPhone, iPad, and TV</p>
+            </div>
+            <div class="feature-item">
+                <span class="feature-icon">📺</span>
+                <h3 class="feature-title">4K HDR</h3>
+                <p class="feature-desc">Cinematic quality streaming</p>
+            </div>
+        </div>
+    </div>
+</body>
+</html>
+"""
+
+def get_connection():
+    return mysql.connector.connect(
+        host=DB_HOST,
+        user=DB_USER,
+        password=DB_PASS,
+        database=DB_NAME
+    )
+
+@app.route("/", methods=["GET", "POST"])
+def home():
+    if request.method == "POST":
+        name = request.form["name"]
+        email = request.form["email"]
+        gender = request.form["gender"]
+
+        conn = get_connection()
+        cursor = conn.cursor()
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                name VARCHAR(100),
+                email VARCHAR(100),
+                gender VARCHAR(20)
+            )
+        """)
+
+        cursor.execute(
+            "INSERT INTO users (name, email, gender) VALUES (%s, %s, %s)",
+            (name, email, gender)
+        )
+
+        conn.commit()
+        cursor.close()
+        conn.close()
+
+    return render_template_string(HTML_FORM)
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000)
+
+🧠 HOW APP CONNECTS TO MYSQL
+Key line:
+DB_HOST = "mysql-0.mysql"
+
+Explanation:
+✔ mysql-0 → Pod name (stable)
+✔ .mysql → Headless service name
+✔ Kubernetes DNS resolves directly
+No IP hardcoding needed.
+
+✅ STEP 8 – Dockerfile
+Dockerfile
+FROM python:3.11-slim
+WORKDIR /app
+COPY app.py .
+RUN pip install flask mysql-connector-python
+CMD ["python", "app.py"]
+
+✅ STEP 9 – Build & Push Image
+Build:
+docker build -t kastrov/stateful-demo:v1 .
+
+Push:
+docker push kastrov/stateful-demo:v1
+
+✅ STEP 10 – Deployment (2 App Pods)
+
+app-deployment.yml
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: flask-app
+spec:
+  replicas: 2	#all the replicas will connect to same headless service. 
+
+  selector:
+    matchLabels:
+      app: flask
+
+  template:
+    metadata:
+      labels:
+        app: flask
+    spec:
+      containers:
+        - name: flask
+          image: kastrov/stateful-demo:v1
+          ports:
+            - containerPort: 5000
+
+
+Apply:
+kubectl apply -f app-deployment.yml
+
+✅ STEP 11 – Service for App
+app-service.yml
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: flask-service
+spec:
+  type: NodePort
+  selector:
+    app: flask
+  ports:
+    - port: 5000
+      targetPort: 5000
+      nodePort: 30007
+
+
+Apply:
+kubectl apply -f app-service.yml
+
+Access:
+http://<node-ip>:30007
+
+✅ STEP 12 – Persistence Verification
+Insert data via UI.
+
+Then:
+kubectl exec -it mysql-0 -- mysql -uroot -prootpass
+
+Inside MySQL:
+USE appdb;
+SELECT * FROM users;
+
+🔥 STEP 13 – CRITICAL TEST (StatefulSet Magic)
+Delete pod:
+kubectl delete pod mysql-0
+
+Wait for recreation:
+kubectl get pods -w
+
+Re-enter:
+kubectl exec -it mysql-0 -- mysql -uroot -prootpass
+
+Run:
+USE appdb;
+SELECT * FROM users;
+✅ DATA STILL EXISTS
+
+❓ WHY DATA SURVIVES?
+Because:
+✔ PVC not deleted
+✔ EBS volume retained
+✔ Volume reattached to new pod
+
+========================================================================
+In the above demo we have only 1 statefulset pod and also we attached IAM Policy to Worker Node Role which is not production grade and also we dint used config maps and secrets. Lets implement all of them in this demo. We will use IRSA here to give permissions. And also we will use primary statefulset pod and replica statefulset pod
+The below is more production grade approach compared to the above
+
+now we’ll turn your current demo into a real production-grade Kubernetes deployment with:
+✅ IRSA (proper IAM, no node role dependency)
+✅ ConfigMap + Secret (secure + flexible config)
+✅ MySQL PRIMARY + REPLICA (real architecture, not fake multi-pod DB)
+✅ Correct Services (no random routing issue)
+✅ ALB Ingress (production traffic handling)
+✅ Improved Flask app + Dockerfile
+✅ Fully explained WHY before EACH step
+
+🚀 FINAL PRODUCTION FLOW
+✅ STEP 1 – IRSA (CRITICAL)
+🔥 WHY?
+Earlier:
+👉 You attached IAM policy to node role ❌
+Problem:
+All pods get same permissions (security risk)
+
+✔️ IRSA SOLVES:
+Pod-level IAM
+Least privilege access
+Required for EBS CSI & ALB controller
+
+🔹 Enable OIDC
+eksctl utils associate-iam-oidc-provider \
+  --cluster kastro-cluster \
+  --region ap-south-1 \
+  --approve
+
+🔹 Create IAM SA for EBS CSI
+eksctl create iamserviceaccount \
+  --name ebs-csi-controller-sa \
+  --namespace kube-system \
+  --cluster kastro-cluster \
+  --region ap-south-1 \
+  --attach-policy-arn arn:aws:iam::aws:policy/service-role/AmazonEBSCSIDriverPolicy \
+  --approve
+
+✅ STEP 2 – Install EBS CSI (WITH IRSA)
+🔥 WHY?
+👉 Enables dynamic provisioning of EBS volumes
+
+helm repo add aws-ebs-csi-driver https://kubernetes-sigs.github.io/aws-ebs-csi-driver
+helm repo update
+
+helm upgrade --install aws-ebs-csi-driver \
+  aws-ebs-csi-driver/aws-ebs-csi-driver \
+  -n kube-system \
+  --set controller.serviceAccount.create=false \
+  --set controller.serviceAccount.name=ebs-csi-controller-sa
+
+✅ STEP 3 – StorageClass (Production)
+🔥 WHY?
+Controls EBS type (gp3)
+Retention policy
+AZ-aware scheduling
+
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: gp3-prod
+provisioner: ebs.csi.aws.com
+# Waits until pod is scheduled → avoids wrong AZ issue
+volumeBindingMode: WaitForFirstConsumer
+# Prevent accidental data deletion
+reclaimPolicy: Retain
+parameters:
+  type: gp3
+  fsType: ext4
+
+✅ STEP 4 – ConfigMap (DB CONFIG)
+🔥 WHY?
+Avoid hardcoding configs
+Reusable & clean
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mysql-config
+data:
+  MYSQL_DATABASE: appdb
+  MYSQL_USER: appuser
+
+✅ STEP 5 – Secret (CREDENTIALS)
+🔥 WHY?
+Secure sensitive data
+Base64 encoded
+
+apiVersion: v1
+kind: Secret
+metadata:
+  name: mysql-secret
+type: Opaque
+data:
+  MYSQL_ROOT_PASSWORD: cm9vdHBhc3M=   # rootpass
+  MYSQL_PASSWORD: YXBwcGFzcw==        # apppass
+
+✅ STEP 6 – MySQL Services (FIXED ARCHITECTURE)
+🔹 Headless (for StatefulSet DNS)
+apiVersion: v1
+kind: Service
+metadata:
+  name: mysql-headless
+spec:
+  clusterIP: None
+  selector:
+    app: mysql
+  ports:
+    - port: 3306
+
+🔹 PRIMARY Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: mysql-primary
+spec:
+  selector:
+    statefulset.kubernetes.io/pod-name: mysql-0
+  ports:
+    - port: 3306
+
+🔹 REPLICA Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: mysql-replica
+spec:
+  selector:
+    app: mysql
+  ports:
+    - port: 3306
+
+✅ STEP 7 – MySQL StatefulSet (PRIMARY + REPLICA)
+🔥 WHY THIS DESIGN?
+mysql-0 → PRIMARY
+mysql-1 → REPLICA
+Separate volumes
+AZ distribution
+
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: mysql
+spec:
+  serviceName: mysql-headless
+  replicas: 2
+
+  selector:
+    matchLabels:
+      app: mysql
+
+  template:
+    metadata:
+      labels:
+        app: mysql
+    spec:
+
+      # Spread across AZs
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app: mysql
+              topologyKey: topology.kubernetes.io/zone
+
+      containers:
+        - name: mysql
+          image: mysql:8
+
+          env:
+            - name: MYSQL_ROOT_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: mysql-secret
+                  key: MYSQL_ROOT_PASSWORD
+
+            - name: MYSQL_DATABASE
+              valueFrom:
+                configMapKeyRef:
+                  name: mysql-config
+                  key: MYSQL_DATABASE
+
+          ports:
+            - containerPort: 3306
+
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "1Gi"
+            limits:
+              cpu: "1"
+              memory: "2Gi"
+
+          volumeMounts:
+            - name: mysql-data
+              mountPath: /var/lib/mysql
+
+  volumeClaimTemplates:
+    - metadata:
+        name: mysql-data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: gp3-prod
+        resources:
+          requests:
+            storage: 20Gi
+
+🚨 CRITICAL: REPLICATION SETUP (MANUAL STEP)
+👉 Kubernetes DOES NOT auto-configure MySQL replication
+
+Step inside mysql-0:
+CREATE USER 'repl'@'%' IDENTIFIED BY 'replpass';
+GRANT REPLICATION SLAVE ON *.* TO 'repl'@'%';
+FLUSH PRIVILEGES;
+
+Get master status:
+SHOW MASTER STATUS;
+
+In mysql-1:
+CHANGE MASTER TO
+  MASTER_HOST='mysql-0.mysql-headless',
+  MASTER_USER='repl',
+  MASTER_PASSWORD='replpass',
+  MASTER_LOG_FILE='binlog.000001',
+  MASTER_LOG_POS=123;
+
+START SLAVE;
+
+✅ STEP 8 – Flask App (UPDATED)
+🔥 WHY CHANGE?
+👉 Previously:
+mysql-0.mysql
+❌ Hardcoded to one pod
+
+✔️ FIX
+import os
+
+DB_HOST = os.getenv("DB_HOST")
+DB_USER = os.getenv("DB_USER")
+DB_PASS = os.getenv("DB_PASS")
+DB_NAME = os.getenv("DB_NAME")
+
+✅ STEP 9 – Dockerfile (PRODUCTION)
+FROM python:3.11-slim
+WORKDIR /app
+COPY app.py .
+RUN pip install --no-cache-dir flask mysql-connector-python
+EXPOSE 5000
+CMD ["python", "app.py"]
+
+✅ STEP 10 – Deployment (PRODUCTION)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: flask-app
+spec:
+  replicas: 3
+
+  selector:
+    matchLabels:
+      app: flask
+
+  template:
+    metadata:
+      labels:
+        app: flask
+    spec:
+      containers:
+        - name: flask
+          image: kastrov/stateful-demo:v2
+
+          env:
+            - name: DB_HOST
+              value: mysql-primary
+
+            - name: DB_USER
+              valueFrom:
+                configMapKeyRef:
+                  name: mysql-config
+                  key: MYSQL_USER
+
+            - name: DB_PASS
+              valueFrom:
+                secretKeyRef:
+                  name: mysql-secret
+                  key: MYSQL_PASSWORD
+
+            - name: DB_NAME
+              valueFrom:
+                configMapKeyRef:
+                  name: mysql-config
+                  key: MYSQL_DATABASE
+
+          ports:
+            - containerPort: 5000
+
+          resources:
+            requests:
+              cpu: "200m"
+              memory: "256Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+
+✅ STEP 11 – Service (ClusterIP)
+apiVersion: v1
+kind: Service
+metadata:
+  name: flask-service
+spec:
+  type: ClusterIP
+  selector:
+    app: flask
+  ports:
+    - port: 5000
+      targetPort: 5000
+
+✅ STEP 12 – AWS LOAD BALANCER CONTROLLER (IRSA)
+🔥 WHY?
+Needed for Ingress → ALB creation
+eksctl create iamserviceaccount \
+  --cluster kastro-cluster \
+  --namespace kube-system \
+  --name aws-load-balancer-controller \
+  --attach-policy-arn arn:aws:iam::aws:policy/ElasticLoadBalancingFullAccess \
+  --approve
+helm install aws-load-balancer-controller eks/aws-load-balancer-controller \
+  -n kube-system \
+  --set clusterName=kastro-cluster \
+  --set serviceAccount.create=false \
+  --set serviceAccount.name=aws-load-balancer-controller
+
+✅ STEP 13 – Ingress (PRODUCTION ENTRY)
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: flask-ingress
+  annotations:
+    kubernetes.io/ingress.class: alb
+spec:
+  rules:
+    - http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: flask-service
+                port:
+                  number: 5000
+
+🔥 FINAL ARCHITECTURE BEHAVIOR
+✔️ DB Layer
+mysql-0 → PRIMARY (writes)
+mysql-1 → REPLICA (reads)
+✔️ App Layer
+3 pods → stateless
+connect → mysql-primary
+✔️ Storage
+Dynamic provisioning ✔️
+Separate EBS volumes ✔️
+✔️ Traffic
+ALB → Ingress → Service → Pods
+🚨 FINAL TRUTH (IMPORTANT)
+
+Even now:
+
+✔️ Infra = Production-grade
+❌ MySQL HA = manual
+❌ Failover = not automatic
